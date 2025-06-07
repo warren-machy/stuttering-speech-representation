@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# model_training.py - Train and evaluate stuttering classification models with class balancing
+# model_training.py - Train and evaluate stuttering classification models with class balancing and data augmentation
 
 import os
 import numpy as np
@@ -7,6 +7,9 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import argparse
 import logging
+import torch
+import torchaudio
+import random
 from datetime import datetime
 from sklearn.model_selection import train_test_split, GridSearchCV, StratifiedKFold
 from sklearn.preprocessing import StandardScaler
@@ -21,6 +24,7 @@ from imblearn.pipeline import Pipeline as ImbPipeline
 from collections import Counter
 import seaborn as sns
 from tqdm import tqdm
+from transformers import Wav2Vec2FeatureExtractor, WavLMModel
 
 # Setup logging
 os.makedirs('logs', exist_ok=True)
@@ -36,15 +40,16 @@ logger = logging.getLogger(__name__)
 
 def parse_args():
     """Parse command line arguments"""
-    parser = argparse.ArgumentParser(description='Train stuttering classification models with class balancing')
+    parser = argparse.ArgumentParser(description='Train stuttering classification models with class balancing and data augmentation')
     
     parser.add_argument('--embeddings_dir', type=str, required=True,
                         help='Directory with extracted embeddings')
     parser.add_argument('--results_dir', type=str, required=True,
                         help='Directory to save results')
     parser.add_argument('--model_type', type=str, default='wavlm',
-                        choices=['whisper', 'wavlm', 'bestrq', 'combined', 'whisper_large_fixed'],
+                        choices=['whisper', 'wavlm', 'wavlm_large', 'bestrq', 'combined', 'whisper_large_fixed'],
                         help='Type of embeddings to use')
+
     parser.add_argument('--split', type=str, default='predefined',
                         choices=['train_test', 'predefined', 'all'],
                         help='How to split the data (predefined=use dataset splits, train_test=manual split)')
@@ -54,8 +59,18 @@ def parse_args():
                         help='Use SMOTE oversampling')
     parser.add_argument('--use_class_weights', action='store_true', default=True,
                         help='Use class weights for imbalanced learning')
+    parser.add_argument('--use_augmentation', action='store_true', default=True,
+                        help='Use audio data augmentation for minority classes')
     parser.add_argument('--smote_k_neighbors', type=int, default=3,
                         help='Number of neighbors for SMOTE')
+    parser.add_argument('--augmentation_factor', type=int, default=3,
+                        help='How many augmented samples to create per minority sample')
+    parser.add_argument('--minority_threshold', type=int, default=100,
+                        help='Classes with fewer samples than this will be augmented')
+    parser.add_argument('--model_name', type=str, default='microsoft/wavlm-large',
+                        help='Model name for re-extracting embeddings from augmented audio (should match extraction script)')
+    parser.add_argument('--device', type=str, default=None,
+                        help='Device to use for model (cuda:0, cuda:1, cpu)')
     parser.add_argument('--n_splits', type=int, default=5,
                         help='Number of cross-validation splits')
     return parser.parse_args()
@@ -124,79 +139,340 @@ def load_data(embeddings_dir, model_type, split='all'):
         
         return metadata_df, all_embeddings
     
-    # Standard handling for non-predefined splits
+    # Standard handling for non-predefined splits (same as before)
     else:
-        # Determine which splits to load
-        if split == 'all':
-            splits_to_load = ['train', 'test', 'devel']
-        else:
-            splits_to_load = [split]
-        
-        all_metadata = []
-        all_embeddings = {}
-        
-        for current_split in splits_to_load:
-            split_dir = os.path.join(model_dir, current_split)
+        logger.error("This updated script currently supports only predefined splits for augmentation")
+        return None, {}
+
+def augment_audio(waveform, sample_rate=16000, augmentation_type='random'):
+    """
+    Apply audio augmentation techniques suitable for stuttering data
+    
+    Args:
+        waveform: Audio waveform as torch tensor
+        sample_rate: Sample rate of the audio
+        augmentation_type: Type of augmentation or 'random' for random selection
+    
+    Returns:
+        Augmented waveform
+    """
+    if isinstance(waveform, np.ndarray):
+        waveform = torch.from_numpy(waveform)
+    
+    # Ensure proper shape [1, samples] for mono audio
+    if waveform.dim() == 1:
+        waveform = waveform.unsqueeze(0)
+    
+    # Random augmentation selection
+    if augmentation_type == 'random':
+        augmentation_type = random.choice(['speed', 'noise', 'pitch', 'volume'])
+    
+    try:
+        if augmentation_type == 'speed':
+            # Speed perturbation (0.9x to 1.1x speed)
+            speed_factor = random.uniform(0.9, 1.1)
+            # Resample to simulate speed change
+            new_sample_rate = int(sample_rate * speed_factor)
+            resampler = torchaudio.transforms.Resample(sample_rate, new_sample_rate)
+            waveform_resampled = resampler(waveform)
+            # Resample back to original rate
+            resampler_back = torchaudio.transforms.Resample(new_sample_rate, sample_rate)
+            waveform = resampler_back(waveform_resampled)
             
-            # If split directory doesn't exist, try loading from model_dir directly
-            if not os.path.exists(split_dir):
-                if current_split == 'train' and os.path.exists(os.path.join(model_dir, 'embedding_metadata.csv')):
-                    split_dir = model_dir
-                else:
-                    logger.warning(f"Split directory not found: {split_dir}")
-                    continue
+        elif augmentation_type == 'noise':
+            # Add Gaussian noise (low level to preserve stuttering characteristics)
+            noise_factor = random.uniform(0.005, 0.02)  # Very light noise
+            noise = torch.randn_like(waveform) * noise_factor
+            waveform = waveform + noise
             
-            # Load metadata
-            metadata_path = os.path.join(split_dir, 'embedding_metadata.csv')
-            if not os.path.exists(metadata_path):
-                logger.warning(f"Metadata file not found: {metadata_path}")
+        elif augmentation_type == 'pitch':
+            # Pitch shifting (±2 semitones)
+            n_steps = random.randint(-2, 2)
+            if n_steps != 0:
+                pitch_shift = torchaudio.transforms.PitchShift(sample_rate, n_steps=n_steps)
+                waveform = pitch_shift(waveform)
+                
+        elif augmentation_type == 'volume':
+            # Volume perturbation (0.8x to 1.2x volume)
+            volume_factor = random.uniform(0.8, 1.2)
+            waveform = waveform * volume_factor
+            
+        # Normalize to prevent clipping
+        waveform = torch.clamp(waveform, -1.0, 1.0)
+        
+        return waveform.squeeze().numpy()
+        
+    except Exception as e:
+        logger.warning(f"Augmentation failed: {e}. Returning original audio.")
+        return waveform.squeeze().numpy()
+
+def load_audio_for_augmentation(file_path, target_sr=16000):
+    """Load audio file for augmentation"""
+    try:
+        waveform, sample_rate = torchaudio.load(file_path)
+        
+        # Convert to mono if needed
+        if waveform.shape[0] > 1:
+            waveform = torch.mean(waveform, dim=0, keepdim=True)
+        
+        # Resample if needed
+        if sample_rate != target_sr:
+            resampler = torchaudio.transforms.Resample(sample_rate, target_sr)
+            waveform = resampler(waveform)
+        
+        return waveform.squeeze().numpy()
+    except Exception as e:
+        logger.error(f"Error loading audio {file_path}: {e}")
+        return None
+
+def extract_embeddings_from_audio(audio_array, model, feature_extractor, device, layer_indices):
+    """Extract embeddings from augmented audio"""
+    try:
+        # Process audio
+        inputs = feature_extractor(
+            audio_array,
+            sampling_rate=16000,
+            return_tensors="pt"
+        ).to(device)
+        
+        # Extract embeddings
+        with torch.no_grad():
+            outputs = model(
+                inputs.input_values,
+                output_hidden_states=True,
+                return_dict=True
+            )
+        
+        hidden_states = outputs.hidden_states
+        embeddings = {}
+        
+        for idx in layer_indices:
+            if idx < len(hidden_states):
+                hidden_state = hidden_states[idx]
+                # Average across time dimension
+                embedding = torch.mean(hidden_state, dim=1).cpu().numpy()
+                embeddings[f"layer_{idx}"] = embedding.flatten()
+        
+        return embeddings
+    except Exception as e:
+        logger.error(f"Error extracting embeddings: {e}")
+        return None
+
+def extract_embeddings_from_audio_wavlm(audio_array, model, feature_extractor, device, layer_indices):
+    """Extract WavLM embeddings from augmented audio"""
+    try:
+        # Process audio
+        inputs = feature_extractor(
+            audio_array,
+            sampling_rate=16000,
+            return_tensors="pt"
+        ).to(device)
+        
+        # Extract embeddings
+        with torch.no_grad():
+            outputs = model(
+                inputs.input_values,
+                output_hidden_states=True,
+                return_dict=True
+            )
+        
+        hidden_states = outputs.hidden_states
+        embeddings = {}
+        
+        for idx in layer_indices:
+            if idx < len(hidden_states):
+                hidden_state = hidden_states[idx]
+                # Average across time dimension
+                embedding = torch.mean(hidden_state, dim=1).cpu().numpy()
+                embeddings[f"layer_{idx}"] = embedding.flatten()
+        
+        return embeddings
+    except Exception as e:
+        logger.error(f"Error extracting WavLM embeddings: {e}")
+        return None
+
+def extract_embeddings_from_audio_whisper(audio_array, model, processor, device, layer_names):
+    """Extract Whisper embeddings from augmented audio"""
+    try:
+        # Process audio for Whisper
+        input_features = processor(
+            audio_array,
+            sampling_rate=16000,
+            return_tensors="pt"
+        ).input_features.to(device)
+        
+        # Extract encoder embeddings
+        with torch.no_grad():
+            encoder_outputs = model.encoder(
+                input_features,
+                output_hidden_states=True,
+                return_dict=True
+            )
+            
+            # Prepare decoder inputs for decoder embeddings
+            decoder_outputs = model.decoder(
+                input_ids=torch.zeros((1, 1), dtype=torch.long).to(device),
+                encoder_hidden_states=encoder_outputs.last_hidden_state,
+                output_hidden_states=True,
+                return_dict=True
+            )
+        
+        encoder_states = encoder_outputs.hidden_states
+        decoder_states = decoder_outputs.hidden_states
+        embeddings = {}
+        
+        # Extract embeddings based on layer names
+        for layer_name in layer_names:
+            if layer_name.startswith('encoder_layer_'):
+                idx = int(layer_name.split('_')[-1])
+                if idx < len(encoder_states):
+                    hidden_state = encoder_states[idx]
+                    embedding = torch.mean(hidden_state, dim=1).cpu().numpy()
+                    embeddings[layer_name] = embedding.flatten()
+            elif layer_name.startswith('decoder_layer_'):
+                idx = int(layer_name.split('_')[-1])
+                if idx < len(decoder_states):
+                    hidden_state = decoder_states[idx]
+                    embedding = hidden_state.squeeze(1).cpu().numpy()
+                    embeddings[layer_name] = embedding.flatten()
+        
+        return embeddings
+    except Exception as e:
+        logger.error(f"Error extracting Whisper embeddings: {e}")
+        return None
+
+def apply_data_augmentation(train_meta, train_embeddings, model, feature_extractor, device, 
+                           layer_names, model_type, augmentation_factor=3, minority_threshold=100):
+    """
+    Apply data augmentation to minority classes
+    
+    Args:
+        train_meta: Training metadata DataFrame
+        train_embeddings: Dictionary of training embeddings
+        model: Pre-trained model for embedding extraction
+        feature_extractor: Feature extractor/processor for the model
+        device: Device to use
+        layer_names: List of layer names to extract embeddings from
+        model_type: Type of model ('wavlm' or 'whisper')
+        augmentation_factor: Number of augmented samples per original sample
+        minority_threshold: Classes with fewer samples will be augmented
+    
+    Returns:
+        Augmented metadata and embeddings
+    """
+    logger.info("\n=== Applying Data Augmentation ===")
+    
+    # Check if we have path information for audio files
+    if 'path' not in train_meta.columns:
+        logger.warning("No audio file paths found. Skipping data augmentation.")
+        return train_meta, train_embeddings
+    
+    # Analyze class distribution
+    if 'label' not in train_meta.columns:
+        logger.warning("No labels found. Skipping data augmentation.")
+        return train_meta, train_embeddings
+    
+    class_counts = train_meta['label'].value_counts()
+    minority_classes = class_counts[class_counts < minority_threshold].index.tolist()
+    
+    logger.info(f"Classes to augment (< {minority_threshold} samples): {minority_classes}")
+    logger.info(f"Augmentation factor: {augmentation_factor}")
+    logger.info(f"Model type for augmentation: {model_type}")
+    
+    if not minority_classes:
+        logger.info("No minority classes found. Skipping augmentation.")
+        return train_meta, train_embeddings
+    
+    # Prepare lists for augmented data
+    augmented_metadata = []
+    augmented_embeddings = {layer: [] for layer in train_embeddings.keys()}
+    
+    # Process each minority class
+    for class_name in minority_classes:
+        class_samples = train_meta[train_meta['label'] == class_name]
+        logger.info(f"Augmenting {len(class_samples)} samples for class '{class_name}'")
+        
+        for idx, row in class_samples.iterrows():
+            # Load original audio
+            audio_path = row['path']
+            original_audio = load_audio_for_augmentation(audio_path)
+            
+            if original_audio is None:
                 continue
             
-            try:
-                metadata_df = pd.read_csv(metadata_path)
-                metadata_df['split'] = current_split
-                all_metadata.append(metadata_df)
-                logger.info(f"Loaded metadata for {len(metadata_df)} files from {current_split} split")
-            except Exception as e:
-                logger.error(f"Error loading metadata from {metadata_path}: {e}")
-                continue
-            
-            # Find embedding files
-            embedding_files = [f for f in os.listdir(split_dir) if f.endswith('_embeddings.npy')]
-            layer_names = [os.path.splitext(f)[0].replace('_embeddings', '') for f in embedding_files]
-            
-            logger.info(f"Found embeddings for {len(layer_names)} layers in {current_split} split: {layer_names}")
-            
-            # Load embeddings for each layer
-            for layer, filename in zip(layer_names, embedding_files):
+            # Create multiple augmented versions
+            for aug_idx in range(augmentation_factor):
                 try:
-                    embedding_array = np.load(os.path.join(split_dir, filename))
+                    # Apply random augmentation
+                    augmented_audio = augment_audio(original_audio, augmentation_type='random')
                     
-                    if layer not in all_embeddings:
-                        all_embeddings[layer] = []
+                    # Extract embeddings from augmented audio based on model type
+                    if model_type.lower() == 'wavlm':
+                        # For WavLM, convert layer names to indices
+                        layer_indices = [int(name.split('_')[1]) for name in layer_names if name.startswith('layer_')]
+                        aug_embeddings = extract_embeddings_from_audio_wavlm(
+                            augmented_audio, model, feature_extractor, device, layer_indices
+                        )
+                    elif model_type.lower() in ['whisper', 'whisper_large_fixed']:
+                        aug_embeddings = extract_embeddings_from_audio_whisper(
+                            augmented_audio, model, feature_extractor, device, layer_names
+                        )
+                    else:
+                        logger.warning(f"Unsupported model type for augmentation: {model_type}")
+                        continue
                     
-                    all_embeddings[layer].append(embedding_array)
-                    logger.info(f"Loaded {layer} embeddings for {current_split} split with shape {embedding_array.shape}")
+                    if aug_embeddings is None:
+                        continue
+                    
+                    # Create metadata entry for augmented sample
+                    aug_metadata = row.copy()
+                    aug_metadata['filename'] = f"{row['filename']}_aug_{aug_idx}"
+                    aug_metadata['augmented'] = True
+                    aug_metadata['augmentation_type'] = 'mixed'
+                    
+                    augmented_metadata.append(aug_metadata)
+                    
+                    # Store embeddings - only for layers that exist in original embeddings
+                    for layer_name, embedding in aug_embeddings.items():
+                        if layer_name in augmented_embeddings:
+                            augmented_embeddings[layer_name].append(embedding)
+                    
                 except Exception as e:
-                    logger.error(f"Error loading {filename}: {e}")
+                    logger.warning(f"Failed to augment sample {row['filename']}: {e}")
+                    continue
+    
+    # Combine original and augmented data
+    if augmented_metadata:
+        # Convert augmented data to arrays
+        for layer_name in augmented_embeddings:
+            if augmented_embeddings[layer_name]:
+                augmented_embeddings[layer_name] = np.array(augmented_embeddings[layer_name])
+                logger.info(f"Created {len(augmented_embeddings[layer_name])} augmented embeddings for {layer_name}")
         
-        # Combine metadata and embeddings
-        if all_metadata:
-            combined_metadata = pd.concat(all_metadata, ignore_index=True)
-            logger.info(f"Combined metadata with {len(combined_metadata)} entries")
+        # Combine metadata
+        aug_meta_df = pd.DataFrame(augmented_metadata)
+        combined_meta = pd.concat([train_meta, aug_meta_df], ignore_index=True)
+        
+        # Combine embeddings
+        combined_embeddings = {}
+        for layer_name in train_embeddings:
+            original = train_embeddings[layer_name]
+            if layer_name in augmented_embeddings and len(augmented_embeddings[layer_name]) > 0:
+                augmented = augmented_embeddings[layer_name]
+                combined_embeddings[layer_name] = np.vstack([original, augmented])
+            else:
+                combined_embeddings[layer_name] = original
             
-            # Combine embeddings
-            for layer in all_embeddings:
-                if len(all_embeddings[layer]) > 1:
-                    all_embeddings[layer] = np.vstack(all_embeddings[layer])
-                else:
-                    all_embeddings[layer] = all_embeddings[layer][0]
-                logger.info(f"Combined {layer} embeddings with final shape {all_embeddings[layer].shape}")
-            
-            return combined_metadata, all_embeddings
-        else:
-            logger.error("No metadata could be loaded")
-            return None, {}
+            logger.info(f"Combined {layer_name}: {original.shape[0]} original + "
+                       f"{len(augmented_embeddings[layer_name]) if layer_name in augmented_embeddings else 0} "
+                       f"augmented = {combined_embeddings[layer_name].shape[0]} total")
+        
+        logger.info(f"Data augmentation complete: {len(train_meta)} → {len(combined_meta)} samples")
+        return combined_meta, combined_embeddings
+    
+    else:
+        logger.warning("No augmented samples were created.")
+        return train_meta, train_embeddings
 
 def check_data_quality(metadata_df, results_dir):
     """Check data quality and label distribution"""
@@ -218,10 +494,28 @@ def check_data_quality(metadata_df, results_dir):
         for label, count in label_counts.items():
             logger.info(f"  {label}: {count}")
     
+        # Check for augmented samples
+        if 'augmented' in metadata_df.columns:
+            aug_counts = metadata_df.groupby(['label', 'augmented']).size().unstack(fill_value=0)
+            logger.info("Original vs Augmented samples:")
+            for label in aug_counts.index:
+                original = aug_counts.loc[label, False] if False in aug_counts.columns else 0
+                augmented = aug_counts.loc[label, True] if True in aug_counts.columns else 0
+                logger.info(f"  {label}: {original} original + {augmented} augmented = {original + augmented} total")
+    
         # Visualize label distribution
-        plt.figure(figsize=(10, 6))
-        label_counts.plot(kind='bar')
-        plt.title('Distribution of Stuttering Labels')
+        plt.figure(figsize=(12, 8))
+        
+        if 'augmented' in metadata_df.columns:
+            # Stacked bar chart showing original vs augmented
+            aug_pivot = metadata_df.groupby(['label', 'augmented']).size().unstack(fill_value=0)
+            aug_pivot.plot(kind='bar', stacked=True, 
+                          color=['skyblue', 'orange'], 
+                          title='Distribution of Stuttering Labels (Original vs Augmented)')
+            plt.legend(['Original', 'Augmented'])
+        else:
+            label_counts.plot(kind='bar', title='Distribution of Stuttering Labels')
+        
         plt.xlabel('Label')
         plt.ylabel('Count')
         plt.xticks(rotation=45)
@@ -441,134 +735,6 @@ def train_improved_models(X_train, y_train, X_test, y_test, use_smote=True,
     
     return results
 
-def train_svm_model(X, y, n_splits=5, random_state=42):
-    """Train an SVM model with cross-validation (legacy function for compatibility)"""
-    if X is None or y is None:
-        logger.error("No valid data provided")
-        return None, None
-    
-    # Create CV splits
-    cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
-    
-    # Define parameter grid
-    param_grid = {
-        'svm__C': [0.1, 1, 10, 100],
-        'svm__gamma': ['scale', 'auto', 0.01, 0.1]
-    }
-    
-    # Create pipeline with scaling
-    pipeline = Pipeline([
-        ('scaler', StandardScaler()),
-        ('svm', SVC(kernel='rbf', probability=True, random_state=random_state, class_weight='balanced'))
-    ])
-    
-    # Create grid search
-    grid_search = GridSearchCV(
-        pipeline, 
-        param_grid, 
-        cv=cv, 
-        scoring='balanced_accuracy',
-        verbose=1,
-        n_jobs=-1
-    )
-    
-    # Fit grid search
-    logger.info("Starting SVM grid search...")
-    grid_search.fit(X, y)
-    
-    logger.info(f"Best parameters: {grid_search.best_params_}")
-    logger.info(f"Best cross-validation score: {grid_search.best_score_:.4f}")
-    
-    # Get CV results
-    cv_results = pd.DataFrame(grid_search.cv_results_)
-    
-    return grid_search.best_estimator_, cv_results
-
-def evaluate_layers_and_classifiers(metadata_df, embeddings, results_dir, test_size=0.2, random_state=42):
-    """Evaluate different layers and classifiers to find the best combination"""
-    layer_names = list(embeddings.keys())
-    if not layer_names or metadata_df is None:
-        logger.error("No data available for evaluation")
-        return None
-    
-    # Classifiers to evaluate
-    classifiers = {
-        'SVM': Pipeline([
-            ('scaler', StandardScaler()),
-            ('clf', SVC(kernel='rbf', C=10, probability=True, random_state=random_state, class_weight='balanced'))
-        ]),
-        'Random Forest': Pipeline([
-            ('scaler', StandardScaler()),
-            ('clf', RandomForestClassifier(n_estimators=100, random_state=random_state, class_weight='balanced'))
-        ])
-    }
-    
-    # Results storage
-    results = []
-    
-    # Evaluate each layer and classifier
-    for layer_name in layer_names:
-        # Prepare data
-        X, y, _ = prepare_data(metadata_df, embeddings, layer_name)
-        
-        if X is None or y is None:
-            continue
-        
-        # Split data
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=test_size, random_state=random_state, stratify=y
-        )
-        
-        for clf_name, pipeline in classifiers.items():
-            logger.info(f"Training {clf_name} on {layer_name}...")
-            
-            # Train model
-            pipeline.fit(X_train, y_train)
-            
-            # Evaluate
-            y_pred = pipeline.predict(X_test)
-            accuracy = accuracy_score(y_test, y_pred)
-            balanced_acc = balanced_accuracy_score(y_test, y_pred)
-            f1 = f1_score(y_test, y_pred, average='weighted')
-            
-            # Store results
-            results.append({
-                'Layer': layer_name,
-                'Classifier': clf_name,
-                'Accuracy': accuracy,
-                'Balanced_Accuracy': balanced_acc,
-                'F1 Score': f1
-            })
-            
-            logger.info(f"{clf_name} on {layer_name}: Accuracy={accuracy:.4f}, Balanced_Acc={balanced_acc:.4f}, F1={f1:.4f}")
-    
-    # Convert to DataFrame
-    results_df = pd.DataFrame(results)
-    
-    # Visualize results
-    plt.figure(figsize=(15, 12))
-    
-    metrics = ['Accuracy', 'Balanced_Accuracy', 'F1 Score']
-    
-    for i, metric in enumerate(metrics, 1):
-        plt.subplot(3, 1, i)
-        for clf_name in classifiers.keys():
-            subset = results_df[results_df['Classifier'] == clf_name]
-            plt.plot(subset['Layer'], subset[metric], marker='o', label=clf_name, linewidth=2, markersize=8)
-        plt.title(f'{metric} by Layer and Classifier', fontsize=14)
-        plt.xlabel('Layer', fontsize=12)
-        plt.ylabel(metric, fontsize=12)
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        plt.xticks(rotation=45)
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(results_dir, 'layer_classifier_comparison.png'), dpi=300, bbox_inches='tight')
-    plt.close()
-    logger.info(f"Saved layer/classifier comparison plot to {os.path.join(results_dir, 'layer_classifier_comparison.png')}")
-    
-    return results_df
-
 def create_comparison_visualizations(results, results_dir, y_test, layer_name):
     """Create comprehensive comparison visualizations"""
     
@@ -635,153 +801,6 @@ def save_detailed_results(results_df, best_result, results_dir, model_type, laye
     
     logger.info(f"Saved detailed results to {results_dir}")
 
-def identify_best_model(eval_results):
-    """Identify the best layer and classifier based on balanced accuracy"""
-    if eval_results is None or len(eval_results) == 0:
-        logger.error("No evaluation results available")
-        return None, None
-    
-    # Find best combination based on Balanced Accuracy
-    best_row = eval_results.loc[eval_results['Balanced_Accuracy'].idxmax()]
-    best_layer = best_row['Layer']
-    best_classifier = best_row['Classifier']
-    
-    logger.info(f"Best model: {best_classifier} on {best_layer}")
-    logger.info(f"Best Balanced Accuracy: {best_row['Balanced_Accuracy']:.4f}")
-    logger.info(f"Best Regular Accuracy: {best_row['Accuracy']:.4f}")
-    logger.info(f"Best F1 Score: {best_row['F1 Score']:.4f}")
-    
-    return best_layer, best_classifier
-
-def evaluate_best_model(metadata_df, embeddings, best_layer, best_classifier, results_dir, test_size=0.2, random_state=42):
-    """Perform detailed evaluation of the best model with normalized confusion matrix"""
-    if best_layer is None or best_classifier is None:
-        logger.error("No best model identified")
-        return None
-    
-    # Prepare data
-    X, y, label_mapping = prepare_data(metadata_df, embeddings, best_layer)
-    
-    if X is None or y is None:
-        logger.error("Could not prepare data")
-        return None
-    
-    # Split data
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=test_size, random_state=random_state, stratify=y
-    )
-    
-    # Create classifier
-    if best_classifier == 'SVM':
-        pipeline = Pipeline([
-            ('scaler', StandardScaler()),
-            ('clf', SVC(kernel='rbf', C=10, probability=True, random_state=random_state, class_weight='balanced'))
-        ])
-    elif best_classifier == 'Random Forest':
-        pipeline = Pipeline([
-            ('scaler', StandardScaler()),
-            ('clf', RandomForestClassifier(n_estimators=100, random_state=random_state, class_weight='balanced'))
-        ])
-    else:
-        logger.error(f"Unknown classifier: {best_classifier}")
-        return None
-    
-    # Train model
-    pipeline.fit(X_train, y_train)
-    
-    # Evaluate
-    y_pred = pipeline.predict(X_test)
-    
-    # Generate classification report
-    report = classification_report(y_test, y_pred)
-    logger.info("Classification Report:")
-    logger.info("\n" + report)
-    
-    # Generate confusion matrix
-    cm = confusion_matrix(y_test, y_pred)
-    
-    # Create normalized confusion matrix (row normalization - each row sums to 1)
-    cm_normalized = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
-    
-    # Plot regular confusion matrix
-    plt.figure(figsize=(12, 10))
-    plt.subplot(2, 1, 1)
-    plt.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
-    plt.title(f'Confusion Matrix: {best_classifier} on {best_layer}')
-    plt.colorbar()
-    
-    # Add labels
-    classes = np.unique(y)
-    tick_marks = np.arange(len(classes))
-    plt.xticks(tick_marks, classes, rotation=45)
-    plt.yticks(tick_marks, classes)
-    plt.xlabel('Predicted Label')
-    plt.ylabel('True Label')
-    
-    # Add text annotations
-    thresh = cm.max() / 2
-    for i in range(cm.shape[0]):
-        for j in range(cm.shape[1]):
-            plt.text(j, i, format(cm[i, j], 'd'),
-                    ha="center", va="center",
-                    color="white" if cm[i, j] > thresh else "black")
-    
-    # Plot normalized confusion matrix
-    plt.subplot(2, 1, 2)
-    plt.imshow(cm_normalized, interpolation='nearest', cmap=plt.cm.Blues)
-    plt.title(f'Normalized Confusion Matrix: {best_classifier} on {best_layer}')
-    plt.colorbar()
-    
-    # Add labels
-    plt.xticks(tick_marks, classes, rotation=45)
-    plt.yticks(tick_marks, classes)
-    plt.xlabel('Predicted Label')
-    plt.ylabel('True Label')
-    
-    # Add text annotations (percentages)
-    for i in range(cm_normalized.shape[0]):
-        for j in range(cm_normalized.shape[1]):
-            # Format as percentage with 1 decimal place
-            plt.text(j, i, format(cm_normalized[i, j]*100, '.1f') + '%',
-                    ha="center", va="center",
-                    color="white" if cm_normalized[i, j] > 0.5 else "black")
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(results_dir, 'confusion_matrix.png'))
-    plt.close()
-    logger.info(f"Saved confusion matrices to {os.path.join(results_dir, 'confusion_matrix.png')}")
-    
-    # Save separate normalized confusion matrix
-    plt.figure(figsize=(10, 8))
-    plt.imshow(cm_normalized, interpolation='nearest', cmap=plt.cm.Blues)
-    plt.title(f'Normalized Confusion Matrix: {best_classifier} on {best_layer}')
-    plt.colorbar()
-    
-    # Add labels
-    plt.xticks(tick_marks, classes, rotation=45)
-    plt.yticks(tick_marks, classes)
-    plt.xlabel('Predicted Label')
-    plt.ylabel('True Label')
-    
-    # Add text annotations (percentages)
-    for i in range(cm_normalized.shape[0]):
-        for j in range(cm_normalized.shape[1]):
-            plt.text(j, i, format(cm_normalized[i, j]*100, '.1f') + '%',
-                    ha="center", va="center",
-                    color="white" if cm_normalized[i, j] > 0.5 else "black")
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(results_dir, 'normalized_confusion_matrix.png'))
-    plt.close()
-    logger.info(f"Saved normalized confusion matrix to {os.path.join(results_dir, 'normalized_confusion_matrix.png')}")
-    
-    # Save detailed results to file
-    with open(os.path.join(results_dir, 'classification_report.txt'), 'w') as f:
-        f.write(f"Best model: {best_classifier} on {best_layer}\n\n")
-        f.write(report)
-    
-    return pipeline
-
 def save_best_model(model, layer_name, model_type, model_config="", results_dir="models"):
     """Save the best model and related information"""
     if model is None or layer_name is None:
@@ -826,6 +845,14 @@ def main():
     os.makedirs('models', exist_ok=True)
     os.makedirs('logs', exist_ok=True)
 
+    # Set up device for augmentation
+    if args.device:
+        device = torch.device(args.device)
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    logger.info(f"Using device: {device}")
+
     # Load data
     logger.info(f"Loading {args.model_type} embeddings from {args.embeddings_dir}")
     metadata_df, embeddings = load_data(args.embeddings_dir, args.model_type, args.split)
@@ -837,9 +864,9 @@ def main():
     # Check data quality
     check_data_quality(metadata_df, args.results_dir)
 
-    # === IF using predefined splits (train/test/devel), respect them ===
+    # === PREDEFINED SPLITS WITH DATA AUGMENTATION ===
     if args.split == 'predefined':
-        logger.info("Using predefined splits: training on 'train', evaluating on 'test' and 'devel'")
+        logger.info("Using predefined splits with optional data augmentation")
 
         # Separate metadata
         train_meta = metadata_df[metadata_df['split'] == 'train'].reset_index(drop=True)
@@ -847,6 +874,43 @@ def main():
         
         logger.info(f"Train split has {len(train_meta)} samples")
         logger.info(f"Test split has {len(test_meta)} samples")
+
+        # Load model for augmentation if needed
+        model = None
+        feature_extractor = None
+        layer_names = []
+        
+        if args.use_augmentation:
+            logger.info(f"Loading model for data augmentation: {args.model_name}")
+            try:
+                # Load model based on model type
+                if args.model_type.lower() == 'wavlm':
+                    from transformers import Wav2Vec2FeatureExtractor, WavLMModel
+                    feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(args.model_name)
+                    model = WavLMModel.from_pretrained(args.model_name).to(device)
+                    
+                    # Get layer names from available embeddings (WavLM format: layer_X)
+                    layer_names = [layer for layer in embeddings.keys() if layer.startswith('layer_')]
+                    logger.info(f"WavLM layer names for augmentation: {layer_names}")
+                    
+                elif args.model_type.lower() in ['whisper', 'whisper_large_fixed']:
+                    from transformers import WhisperProcessor, WhisperModel
+                    feature_extractor = WhisperProcessor.from_pretrained(args.model_name)
+                    model = WhisperModel.from_pretrained(args.model_name).to(device)
+                    
+                    # Get layer names from available embeddings (Whisper format: encoder_layer_X, decoder_layer_X)
+                    layer_names = [layer for layer in embeddings.keys() 
+                                 if layer.startswith('encoder_layer_') or layer.startswith('decoder_layer_')]
+                    logger.info(f"Whisper layer names for augmentation: {layer_names}")
+                    
+                else:
+                    logger.warning(f"Data augmentation not supported for model type: {args.model_type}")
+                    args.use_augmentation = False
+                    
+            except Exception as e:
+                logger.error(f"Failed to load model for augmentation: {e}")
+                logger.warning("Continuing without data augmentation.")
+                args.use_augmentation = False
 
         best_model = None
         best_layer = None
@@ -868,8 +932,18 @@ def main():
             
             logger.info(f"Filtered {layer_name} embeddings to {n_train} train samples and {n_test} test samples")
             
-            # Prepare data with filtered embeddings
-            X_train, y_train, _ = prepare_data(train_meta, train_embeddings, layer_name)
+            # Apply data augmentation to training data
+            if args.use_augmentation and model is not None:
+                train_meta_aug, train_embeddings_aug = apply_data_augmentation(
+                    train_meta, train_embeddings, model, feature_extractor, device,
+                    layer_names, args.model_type, args.augmentation_factor, args.minority_threshold
+                )
+            else:
+                train_meta_aug = train_meta
+                train_embeddings_aug = train_embeddings
+            
+            # Prepare data with potentially augmented embeddings
+            X_train, y_train, _ = prepare_data(train_meta_aug, train_embeddings_aug, layer_name)
             X_test, y_test, _ = prepare_data(test_meta, test_embeddings, layer_name)
             
             if X_train is None or X_test is None:
@@ -936,7 +1010,10 @@ def main():
                 f.write(f"Balanced Accuracy: {best_result['Balanced_Accuracy']:.4f}\n")
                 f.write(f"Regular Accuracy: {best_result['Accuracy']:.4f}\n")
                 f.write(f"F1 Weighted: {best_result['F1_Weighted']:.4f}\n")
-                f.write(f"F1 Macro: {best_result['F1_Macro']:.4f}\n\n")
+                f.write(f"F1 Macro: {best_result['F1_Macro']:.4f}\n")
+                f.write(f"Data Augmentation: {args.use_augmentation}\n")
+                f.write(f"SMOTE: {args.use_smote}\n")
+                f.write(f"Class Weights: {args.use_class_weights}\n\n")
                 f.write(report)
         
         # Create overall comparison across layers
@@ -996,32 +1073,6 @@ def main():
             
             logger.info(f"Saved overall layer comparison to {args.results_dir}")
 
-    else:
-        # Default: combine all and perform random split
-        eval_results = evaluate_layers_and_classifiers(
-            metadata_df, embeddings, args.results_dir, test_size=args.test_size
-        )
-
-        if eval_results is None:
-            logger.error("Evaluation failed. Exiting.")
-            return
-
-        best_layer, best_classifier = identify_best_model(eval_results)
-
-        if best_layer is None or best_classifier is None:
-            logger.error("Failed to identify best model. Exiting.")
-            return
-
-        best_model = evaluate_best_model(
-            metadata_df, embeddings, best_layer, best_classifier, args.results_dir, test_size=args.test_size
-        )
-
-        if best_model is None:
-            logger.error("Detailed evaluation failed. Exiting.")
-            return
-
-        save_best_model(best_model, best_layer, args.model_type)
-
     # Final summary
     if args.split == 'predefined' and best_model:
         logger.info(f"\n{'='*80}")
@@ -1036,6 +1087,9 @@ def main():
         
         # Save best model
         model_config = f"{best_model['Model']}_{best_model['Data']}"
+        if args.use_augmentation:
+            model_config += "_augmented"
+        
         model_path = save_best_model(best_model['Pipeline'], best_layer, args.model_type, 
                                    model_config, os.path.join(args.results_dir, 'models'))
         
@@ -1044,6 +1098,10 @@ def main():
             f.write("=== FINAL EXPERIMENT SUMMARY ===\n\n")
             f.write(f"Dataset: {args.model_type} embeddings\n")
             f.write(f"Split strategy: {args.split}\n")
+            f.write(f"Data Augmentation: {args.use_augmentation}\n")
+            if args.use_augmentation:
+                f.write(f"  Augmentation factor: {args.augmentation_factor}\n")
+                f.write(f"  Minority threshold: {args.minority_threshold}\n")
             f.write(f"SMOTE used: {args.use_smote}\n")
             f.write(f"Class weights used: {args.use_class_weights}\n\n")
             f.write(f"Best overall configuration:\n")
@@ -1057,19 +1115,9 @@ def main():
             f.write(f"Model saved to: {model_path}\n")
             
         logger.info(f"Saved final summary to {args.results_dir}")
-        
-    elif args.split != 'predefined':
-        # Summary for random split approach
-        logger.info("\n=== Model Training and Evaluation Summary ===")
-        logger.info(f"Model type: {args.model_type}")
-        logger.info(f"Evaluated {len(embeddings)} layers with multiple classifiers")
-        logger.info(f"Best model: {best_classifier} on {best_layer}")
-        if 'eval_results' in locals():
-            best_row = eval_results[(eval_results['Layer'] == best_layer) & (eval_results['Classifier'] == best_classifier)].iloc[0]
-            logger.info(f"Balanced Accuracy: {best_row['Balanced_Accuracy']:.4f}")
-            logger.info(f"F1 Score: {best_row['F1 Score']:.4f}")
-            logger.info(f"Accuracy: {best_row['Accuracy']:.4f}")
-        logger.info("\nResults and models saved to disk.")
+
+    logger.info("\n=== Model Training and Evaluation Complete ===")
+    logger.info("All results, models, and visualizations have been saved.")
 
 if __name__ == "__main__":
     main()
