@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# model_training.py - Train and evaluate stuttering classification models with class balancing and data augmentation
+# model_training_fixed.py - Fixed training script with working data augmentation
 
 import os
 import numpy as np
@@ -24,7 +24,6 @@ from imblearn.pipeline import Pipeline as ImbPipeline
 from collections import Counter
 import seaborn as sns
 from tqdm import tqdm
-from transformers import Wav2Vec2FeatureExtractor, WavLMModel
 
 # Setup logging
 os.makedirs('logs', exist_ok=True)
@@ -39,14 +38,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 def parse_args():
-    """Parse command line arguments"""
+    """Parse command line arguments with FIXED defaults"""
     parser = argparse.ArgumentParser(description='Train stuttering classification models with class balancing and data augmentation')
     
     parser.add_argument('--embeddings_dir', type=str, required=True,
                         help='Directory with extracted embeddings')
     parser.add_argument('--results_dir', type=str, required=True,
                         help='Directory to save results')
-    parser.add_argument('--model_type', type=str, default='wavlm',
+    parser.add_argument('--model_type', type=str, default='wavlm_large',
                         choices=['whisper', 'wavlm', 'wavlm_large', 'bestrq', 'combined', 'whisper_large_fixed'],
                         help='Type of embeddings to use')
 
@@ -55,25 +54,47 @@ def parse_args():
                         help='How to split the data (predefined=use dataset splits, train_test=manual split)')
     parser.add_argument('--test_size', type=float, default=0.2,
                         help='Test size for train_test split')
-    parser.add_argument('--use_smote', action='store_true', default=True,
-                        help='Use SMOTE oversampling')
-    parser.add_argument('--use_class_weights', action='store_true', default=True,
-                        help='Use class weights for imbalanced learning')
-    parser.add_argument('--use_augmentation', action='store_true', default=True,
-                        help='Use audio data augmentation for minority classes')
+    
+    # FIXED: Proper boolean argument handling
+    parser.add_argument('--use_smote', type=bool, default=True,
+                        help='Use SMOTE oversampling (default: True)')
+    parser.add_argument('--no_smote', action='store_true',
+                        help='Disable SMOTE oversampling')
+    
+    parser.add_argument('--use_class_weights', type=bool, default=True,
+                        help='Use class weights for imbalanced learning (default: True)')
+    parser.add_argument('--no_class_weights', action='store_true',
+                        help='Disable class weights')
+    
+    parser.add_argument('--use_augmentation', type=bool, default=True,
+                        help='Use audio data augmentation for minority classes (default: True)')
+    parser.add_argument('--no_augmentation', action='store_true',
+                        help='Disable data augmentation')
+    
     parser.add_argument('--smote_k_neighbors', type=int, default=3,
                         help='Number of neighbors for SMOTE')
-    parser.add_argument('--augmentation_factor', type=int, default=3,
+    parser.add_argument('--augmentation_factor', type=int, default=2,
                         help='How many augmented samples to create per minority sample')
-    parser.add_argument('--minority_threshold', type=int, default=100,
+    parser.add_argument('--minority_threshold', type=int, default=200,
                         help='Classes with fewer samples than this will be augmented')
     parser.add_argument('--model_name', type=str, default='microsoft/wavlm-large',
-                        help='Model name for re-extracting embeddings from augmented audio (should match extraction script)')
+                        help='Model name for re-extracting embeddings from augmented audio')
     parser.add_argument('--device', type=str, default=None,
                         help='Device to use for model (cuda:0, cuda:1, cpu)')
     parser.add_argument('--n_splits', type=int, default=5,
                         help='Number of cross-validation splits')
-    return parser.parse_args()
+    
+    args = parser.parse_args()
+    
+    # Handle the negative flags
+    if args.no_smote:
+        args.use_smote = False
+    if args.no_class_weights:
+        args.use_class_weights = False
+    if args.no_augmentation:
+        args.use_augmentation = False
+        
+    return args
 
 def load_data(embeddings_dir, model_type, split='all'):
     """Load embeddings and metadata"""
@@ -96,7 +117,7 @@ def load_data(embeddings_dir, model_type, split='all'):
             meta_path = os.path.join(model_dir, sub_split, 'embedding_metadata.csv')
             if not os.path.exists(meta_path):
                 logger.error(f"Metadata file not found for {sub_split}: {meta_path}")
-                exit()
+                return None, {}
             
             df = pd.read_csv(meta_path)
             df['split'] = sub_split
@@ -139,22 +160,13 @@ def load_data(embeddings_dir, model_type, split='all'):
         
         return metadata_df, all_embeddings
     
-    # Standard handling for non-predefined splits (same as before)
     else:
-        logger.error("This updated script currently supports only predefined splits for augmentation")
+        logger.error("This script currently supports only predefined splits")
         return None, {}
 
 def augment_audio(waveform, sample_rate=16000, augmentation_type='random'):
     """
-    Apply audio augmentation techniques suitable for stuttering data
-    
-    Args:
-        waveform: Audio waveform as torch tensor
-        sample_rate: Sample rate of the audio
-        augmentation_type: Type of augmentation or 'random' for random selection
-    
-    Returns:
-        Augmented waveform
+    Apply conservative audio augmentation suitable for stuttering data
     """
     if isinstance(waveform, np.ndarray):
         waveform = torch.from_numpy(waveform)
@@ -163,39 +175,34 @@ def augment_audio(waveform, sample_rate=16000, augmentation_type='random'):
     if waveform.dim() == 1:
         waveform = waveform.unsqueeze(0)
     
-    # Random augmentation selection
+    # Random augmentation selection with conservative parameters
     if augmentation_type == 'random':
-        augmentation_type = random.choice(['speed', 'noise', 'pitch', 'volume'])
+        augmentation_type = random.choice(['speed', 'noise', 'volume', 'none'])
     
     try:
         if augmentation_type == 'speed':
-            # Speed perturbation (0.9x to 1.1x speed)
-            speed_factor = random.uniform(0.9, 1.1)
-            # Resample to simulate speed change
+            # Very conservative speed perturbation (0.95x to 1.05x speed)
+            speed_factor = random.uniform(0.95, 1.05)
             new_sample_rate = int(sample_rate * speed_factor)
             resampler = torchaudio.transforms.Resample(sample_rate, new_sample_rate)
             waveform_resampled = resampler(waveform)
-            # Resample back to original rate
             resampler_back = torchaudio.transforms.Resample(new_sample_rate, sample_rate)
             waveform = resampler_back(waveform_resampled)
             
         elif augmentation_type == 'noise':
-            # Add Gaussian noise (low level to preserve stuttering characteristics)
-            noise_factor = random.uniform(0.005, 0.02)  # Very light noise
+            # Very light noise (preserving stuttering characteristics)
+            noise_factor = random.uniform(0.001, 0.005)  # Extremely light
             noise = torch.randn_like(waveform) * noise_factor
             waveform = waveform + noise
-            
-        elif augmentation_type == 'pitch':
-            # Pitch shifting (±2 semitones)
-            n_steps = random.randint(-2, 2)
-            if n_steps != 0:
-                pitch_shift = torchaudio.transforms.PitchShift(sample_rate, n_steps=n_steps)
-                waveform = pitch_shift(waveform)
                 
         elif augmentation_type == 'volume':
-            # Volume perturbation (0.8x to 1.2x volume)
-            volume_factor = random.uniform(0.8, 1.2)
+            # Conservative volume perturbation (0.9x to 1.1x volume)
+            volume_factor = random.uniform(0.9, 1.1)
             waveform = waveform * volume_factor
+            
+        elif augmentation_type == 'none':
+            # Sometimes don't augment at all
+            pass
             
         # Normalize to prevent clipping
         waveform = torch.clamp(waveform, -1.0, 1.0)
@@ -223,39 +230,6 @@ def load_audio_for_augmentation(file_path, target_sr=16000):
         return waveform.squeeze().numpy()
     except Exception as e:
         logger.error(f"Error loading audio {file_path}: {e}")
-        return None
-
-def extract_embeddings_from_audio(audio_array, model, feature_extractor, device, layer_indices):
-    """Extract embeddings from augmented audio"""
-    try:
-        # Process audio
-        inputs = feature_extractor(
-            audio_array,
-            sampling_rate=16000,
-            return_tensors="pt"
-        ).to(device)
-        
-        # Extract embeddings
-        with torch.no_grad():
-            outputs = model(
-                inputs.input_values,
-                output_hidden_states=True,
-                return_dict=True
-            )
-        
-        hidden_states = outputs.hidden_states
-        embeddings = {}
-        
-        for idx in layer_indices:
-            if idx < len(hidden_states):
-                hidden_state = hidden_states[idx]
-                # Average across time dimension
-                embedding = torch.mean(hidden_state, dim=1).cpu().numpy()
-                embeddings[f"layer_{idx}"] = embedding.flatten()
-        
-        return embeddings
-    except Exception as e:
-        logger.error(f"Error extracting embeddings: {e}")
         return None
 
 def extract_embeddings_from_audio_wavlm(audio_array, model, feature_extractor, device, layer_indices):
@@ -342,25 +316,14 @@ def extract_embeddings_from_audio_whisper(audio_array, model, processor, device,
         return None
 
 def apply_data_augmentation(train_meta, train_embeddings, model, feature_extractor, device, 
-                           layer_names, model_type, augmentation_factor=3, minority_threshold=100):
+                           layer_names, model_type, augmentation_factor=2, minority_threshold=200):
     """
-    Apply data augmentation to minority classes
-    
-    Args:
-        train_meta: Training metadata DataFrame
-        train_embeddings: Dictionary of training embeddings
-        model: Pre-trained model for embedding extraction
-        feature_extractor: Feature extractor/processor for the model
-        device: Device to use
-        layer_names: List of layer names to extract embeddings from
-        model_type: Type of model ('wavlm' or 'whisper')
-        augmentation_factor: Number of augmented samples per original sample
-        minority_threshold: Classes with fewer samples will be augmented
-    
-    Returns:
-        Augmented metadata and embeddings
+    Apply CONSERVATIVE data augmentation to minority classes
     """
     logger.info("\n=== Applying Data Augmentation ===")
+    logger.info(f"Augmentation enabled: True")
+    logger.info(f"Augmentation factor: {augmentation_factor}")
+    logger.info(f"Minority threshold: {minority_threshold}")
     
     # Check if we have path information for audio files
     if 'path' not in train_meta.columns:
@@ -375,9 +338,11 @@ def apply_data_augmentation(train_meta, train_embeddings, model, feature_extract
     class_counts = train_meta['label'].value_counts()
     minority_classes = class_counts[class_counts < minority_threshold].index.tolist()
     
+    logger.info(f"Current class distribution:")
+    for class_name, count in class_counts.items():
+        logger.info(f"  {class_name}: {count} samples")
+    
     logger.info(f"Classes to augment (< {minority_threshold} samples): {minority_classes}")
-    logger.info(f"Augmentation factor: {augmentation_factor}")
-    logger.info(f"Model type for augmentation: {model_type}")
     
     if not minority_classes:
         logger.info("No minority classes found. Skipping augmentation.")
@@ -387,14 +352,23 @@ def apply_data_augmentation(train_meta, train_embeddings, model, feature_extract
     augmented_metadata = []
     augmented_embeddings = {layer: [] for layer in train_embeddings.keys()}
     
+    total_augmented = 0
+    
     # Process each minority class
     for class_name in minority_classes:
         class_samples = train_meta[train_meta['label'] == class_name]
         logger.info(f"Augmenting {len(class_samples)} samples for class '{class_name}'")
         
+        class_augmented = 0
+        
         for idx, row in class_samples.iterrows():
             # Load original audio
             audio_path = row['path']
+            
+            if not os.path.exists(audio_path):
+                logger.warning(f"Audio file not found: {audio_path}")
+                continue
+                
             original_audio = load_audio_for_augmentation(audio_path)
             
             if original_audio is None:
@@ -403,11 +377,11 @@ def apply_data_augmentation(train_meta, train_embeddings, model, feature_extract
             # Create multiple augmented versions
             for aug_idx in range(augmentation_factor):
                 try:
-                    # Apply random augmentation
+                    # Apply augmentation
                     augmented_audio = augment_audio(original_audio, augmentation_type='random')
                     
                     # Extract embeddings from augmented audio based on model type
-                    if model_type.lower() == 'wavlm':
+                    if model_type.lower() in ['wavlm', 'wavlm_large']:
                         # For WavLM, convert layer names to indices
                         layer_indices = [int(name.split('_')[1]) for name in layer_names if name.startswith('layer_')]
                         aug_embeddings = extract_embeddings_from_audio_wavlm(
@@ -437,9 +411,14 @@ def apply_data_augmentation(train_meta, train_embeddings, model, feature_extract
                         if layer_name in augmented_embeddings:
                             augmented_embeddings[layer_name].append(embedding)
                     
+                    class_augmented += 1
+                    total_augmented += 1
+                    
                 except Exception as e:
                     logger.warning(f"Failed to augment sample {row['filename']}: {e}")
                     continue
+        
+        logger.info(f"Successfully augmented {class_augmented} samples for class '{class_name}'")
     
     # Combine original and augmented data
     if augmented_metadata:
@@ -467,7 +446,17 @@ def apply_data_augmentation(train_meta, train_embeddings, model, feature_extract
                        f"{len(augmented_embeddings[layer_name]) if layer_name in augmented_embeddings else 0} "
                        f"augmented = {combined_embeddings[layer_name].shape[0]} total")
         
+        # Log final class distribution
+        if 'label' in combined_meta.columns:
+            new_class_counts = combined_meta['label'].value_counts()
+            logger.info(f"New class distribution after augmentation:")
+            for class_name, count in new_class_counts.items():
+                original_count = class_counts.get(class_name, 0)
+                augmented_count = count - original_count
+                logger.info(f"  {class_name}: {count} total ({original_count} original + {augmented_count} augmented)")
+        
         logger.info(f"Data augmentation complete: {len(train_meta)} → {len(combined_meta)} samples")
+        logger.info(f"Total augmented samples created: {total_augmented}")
         return combined_meta, combined_embeddings
     
     else:
@@ -840,6 +829,17 @@ def main():
     # Parse arguments
     args = parse_args()
 
+    # Print configuration
+    logger.info("=== CONFIGURATION ===")
+    logger.info(f"Model type: {args.model_type}")
+    logger.info(f"Embeddings directory: {args.embeddings_dir}")
+    logger.info(f"Results directory: {args.results_dir}")
+    logger.info(f"Use SMOTE: {args.use_smote}")
+    logger.info(f"Use class weights: {args.use_class_weights}")
+    logger.info(f"Use augmentation: {args.use_augmentation}")
+    logger.info(f"Augmentation factor: {args.augmentation_factor}")
+    logger.info(f"Minority threshold: {args.minority_threshold}")
+
     # Create output directories
     os.makedirs(args.results_dir, exist_ok=True)
     os.makedirs('models', exist_ok=True)
@@ -884,7 +884,7 @@ def main():
             logger.info(f"Loading model for data augmentation: {args.model_name}")
             try:
                 # Load model based on model type
-                if args.model_type.lower() == 'wavlm':
+                if args.model_type.lower() in ['wavlm', 'wavlm_large']:
                     from transformers import Wav2Vec2FeatureExtractor, WavLMModel
                     feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(args.model_name)
                     model = WavLMModel.from_pretrained(args.model_name).to(device)
@@ -939,6 +939,7 @@ def main():
                     layer_names, args.model_type, args.augmentation_factor, args.minority_threshold
                 )
             else:
+                logger.info("Skipping data augmentation")
                 train_meta_aug = train_meta
                 train_embeddings_aug = train_embeddings
             
